@@ -12,17 +12,24 @@ const SCOUT = 10_000_000n;
 const WIDE = 10_000;
 
 const closes = new Map<string, (bigint | null)[]>();
+let universe: string[] = [];
 let nextCheck = -1;
 let pendingBuys: string[] | null = null;
 
-function basketBps(state: BarsState, base: number): bigint | null {
+/** The close `offset` bars after `base`, or null when that bar has no price at all. */
+function closing(symbol: string, base: number, offset: number): bigint | null {
+  const series = closes.get(symbol)!;
+  const value = series[base + offset];
+  return value === undefined ? null : value;
+}
+
+function basketBps(base: number): bigint | null {
   let total = 0n;
   let seen = 0;
-  for (const { symbol } of state.hello.symbols) {
-    const series = closes.get(symbol)!;
-    const now = series[base + GATE];
-    const then = series[base];
-    if (now === undefined || then === undefined || now === null || then === null || then === 0n) continue;
+  for (const symbol of universe) {
+    const now = closing(symbol, base, GATE);
+    const then = closing(symbol, base, 0);
+    if (now === null || then === null || then === 0n) continue;
     total += ((now - then) * BPS) / then;
     seen++;
   }
@@ -32,11 +39,10 @@ function basketBps(state: BarsState, base: number): bigint | null {
 /** Leaders by exact twelve-bar return; ties keep universe order. */
 function leaders(state: BarsState, base: number): string[] {
   const ranked: { symbol: string; now: bigint; then: bigint }[] = [];
-  for (const { symbol } of state.hello.symbols) {
-    const series = closes.get(symbol)!;
-    const now = series[base + GATE];
-    const then = series[base];
-    if (now !== undefined && then !== undefined && now !== null && then !== null) ranked.push({ symbol, now, then });
+  for (const symbol of universe) {
+    const now = closing(symbol, base, GATE);
+    const then = closing(symbol, base, 0);
+    if (now !== null && then !== null) ranked.push({ symbol, now, then });
   }
   ranked.sort((a, b) => {
     const left = a.now * b.then;
@@ -71,16 +77,17 @@ function exit(state: BarsState, symbols: readonly string[]): OrderInput[] {
 
 await runBars({
   onHello(state) {
-    for (const { symbol } of state.hello.symbols) closes.set(symbol, []);
+    universe = state.hello.symbols.map(({ symbol }) => symbol);
+    for (const symbol of universe) closes.set(symbol, []);
     nextCheck = state.warmupBars + GATE;
   },
   onBatch(state) {
-    for (const { symbol } of state.hello.symbols) closes.get(symbol)!.push(state.close(symbol));
+    for (const symbol of universe) closes.get(symbol)!.push(state.close(symbol));
     if (state.warmingUp) return [];
 
     const bar = state.seq - state.warmupBars;
     if (bar < 8) {
-      const symbol = state.symbols.has('SOL') ? 'SOL' : state.hello.symbols[0]!.symbol;
+      const symbol = universe.includes('SOL') ? 'SOL' : universe[0]!;
       if (bar % 2 === 0) {
         if (state.close(symbol) !== null && !state.positions.has(symbol) && state.cash > SCOUT) {
           return [{ side: 'buy', symbol, notional_quote_units: SCOUT, max_slippage_bps: WIDE }];
@@ -100,8 +107,8 @@ await runBars({
     if (state.seq < nextCheck) return [];
     nextCheck = state.seq + GATE;
 
-    const base = closes.get(state.hello.symbols[0]!.symbol)!.length - 1 - GATE;
-    const gate = basketBps(state, base);
+    const base = closes.get(universe[0]!)!.length - 1 - GATE;
+    const gate = basketBps(base);
     const want = gate !== null && gate > GATE_BPS ? leaders(state, base) : [];
     const gone = [...state.positions.keys()].filter((symbol) => !want.includes(symbol));
     if (gone.length > 0) {
